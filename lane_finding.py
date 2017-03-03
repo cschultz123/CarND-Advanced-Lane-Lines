@@ -1,7 +1,6 @@
 import cv2
 import image_utils
 import numpy as np
-from scipy.signal import find_peaks_cwt
 
 
 def process_gradients(img, x_thresh, y_thresh, mag_thresh, dir_thresh):
@@ -166,140 +165,126 @@ def process_image(img,
     # filter and apply perspective tranform for birds eye view
     top, M, Minv = pipeline(undist, hue_thresh, sat_thresh, x_thresh, y_thresh, mag_thresh, dir_thresh)
 
-    # filter and isolate right and left lanes
-    right, left = find_lanes(top, windows, peak_offset)
-
-    # fit 2nd order polynomial to left and right lanes
-    rpts, lpts = fit_lanes(right, left)
+    # # filter and isolate right and left lanes
+    # right, left = find_lanes(top, windows, peak_offset)
+    #
+    # # fit 2nd order polynomial to left and right lanes
+    # rpts, lpts = fit_lanes(right, left)
+    left_fit, right_fit = find_lanes(top)
 
     # draw lanes on original undistorted image
-    return draw_lanes(undist, rfit=rpts, lfit=lpts, Minv=Minv)
+    return draw_lanes(undist, rfit=right_fit, lfit=left_fit, Minv=Minv)
 
 
-def moving_average(a, n=3):
-    ret = np.cumsum(a, dtype=float)
-    ret[n:] = ret[n:] - ret[:-n]
-    return ret[n - 1:] / n
+class Lanes(object):
+    """
+    This class provides methods for finding lanes from image. It also stores
+    state that is used for outlier detection.
+    """
+
+    def __init__(self):
+        pass
 
 
-def find_lanes(img, windows=5, peak_offset=50):
-    # copy input image
-    top_down = np.copy(img).astype(np.uint8)
 
-    # create masks
-    l_mask = np.zeros_like(img, dtype=np.uint8)
-    r_mask = np.zeros_like(img, dtype=np.uint8)
+def find_lanes(img, num_windows=9, window_margin=100, minimum_pixels=50):
+    """
+    This function applies a sliding window technique to identify the lanes and
+    fit a 2nd order polynomial to them.
 
-    # image dimensions
-    height, width = top_down.shape[0], top_down.shape[1]
+    :param img: (binary) thresholded and warped image
+    :param num_windows: (int) number of vertical windows
+    :param window_margin: (int) window width +/- margin
+    :param minimum_pixels: (int) number of pixels required to move window center
+    :return: left lane line coefficients, right lane line coefficients
+    """
+    # Take a histogram of the whole of the image
+    histogram = np.sum(img[:, :], axis=0)
 
-    # window parameters
-    window_size = int(height / (windows))
+    # Find the peak of the left and right halves of the histogram
+    # These will be the starting point for the left and right lines
+    midpoint = np.int(histogram.shape[0] / 2)
+    leftx_base = np.argmax(histogram[:midpoint])
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
-    # compute initial peaks using majority of image
-    mean_lane = np.mean(top_down[height / 2:, :], axis=0)
-    mean_lane = moving_average(mean_lane, width / 20)
-    idx = find_peaks_cwt(mean_lane, [100], max_distances=[800])
+    # Set height of windows
+    window_height = np.int(img.shape[0] / num_windows)
 
-    # right and left peak indicies
-    r_peak = np.max(idx[:2])
-    r_peak_last = r_peak
-    l_peak = np.min(idx[:2])
-    l_peak_last = l_peak
+    # Identify the x and y positions of all nonzero pixels in the image
+    nonzero = img.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
 
-    # peak location delta
-    dr = 0
-    dl = 0
+    # Current positions to be updated for each window
+    leftx_current = leftx_base
+    rightx_current = rightx_base
 
-    for i in range(windows):
+    # Create empty lists to receive left and right lane pixel indices
+    left_lane_inds = []
+    right_lane_inds = []
 
-        y_min = i * window_size
-        y_max = y_min + window_size
+    # Step through the windows one by one
+    for window in range(num_windows):
+        # Identify window boundaries in x and y (and right and left)
+        win_y_low = img.shape[0] - (window + 1) * window_height
+        win_y_high = img.shape[0] - window * window_height
+        win_xleft_low = leftx_current - window_margin
+        win_xleft_high = leftx_current + window_margin
+        win_xright_low = rightx_current - window_margin
+        win_xright_high = rightx_current + window_margin
+        # Identify the nonzero pixels in x and y within the window
+        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & (nonzerox >= win_xleft_low) & (
+        nonzerox < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & (nonzerox >= win_xright_low) & (
+        nonzerox < win_xright_high)).nonzero()[0]
+        # Append these indices to the lists
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
+        # If you found > minpix pixels, recenter next window on their mean position
+        if len(good_left_inds) > minimum_pixels:
+            leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
+        if len(good_right_inds) > minimum_pixels:
+            rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
 
-        # generate horizontal slice
-        hslice = top_down[y_min:y_max, :]
+    # Concatenate the arrays of indices
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
 
-        # find peaks
-        mean_lane = np.mean(hslice, axis=0)
-        mean_lane = moving_average(mean_lane, width / 20)
-        idx = find_peaks_cwt(mean_lane, [100], max_distances=[800])
+    # Extract left and right line pixel positions
+    leftx = nonzerox[left_lane_inds]
+    lefty = nonzeroy[left_lane_inds]
+    rightx = nonzerox[right_lane_inds]
+    righty = nonzeroy[right_lane_inds]
 
-        # two peaks found
-        if len(idx) >= 2:
-            r_peak = np.max(idx[:2])
-            l_peak = np.min(idx[:2])
+    # Fit a second order polynomial to each
+    left_fit = np.polyfit(lefty, leftx, 2)
+    right_fit = np.polyfit(righty, rightx, 2)
 
-        # one peak found
-        elif len(idx) == 1:
-            if np.abs(r_peak - idx[0]) < np.abs(l_peak - idx[0]):
-                r_peak = idx[0]
-                l_peak = l_peak_last + dl
-            else:
-                l_peak = idx[0]
-                r_peak = r_peak_last + dr
-
-        # no peaks found
-        else:
-            r_peak = r_peak_last + dr
-            l_peak = l_peak_last + dl
-
-        # outlier detection
-        if np.abs(r_peak - r_peak_last) > 100:
-            r_peak = r_peak_last
-        if np.abs(l_peak - l_peak_last) > 100:
-            l_peak = l_peak_last
-
-        # populate lane mask for slice
-        r_min, r_max = np.clip([r_peak - peak_offset, r_peak + peak_offset], 0, width)
-        l_min, l_max = np.clip([l_peak - peak_offset, l_peak + peak_offset], 0, width)
-        r_mask[y_min:y_max, r_min:r_max] = 1
-        l_mask[y_min:y_max, l_min:l_max] = 1
-
-        if i > 0:
-            dr = r_peak - r_peak_last
-            dl = l_peak - l_peak_last
-
-        r_peak_last = r_peak
-        l_peak_last = l_peak
-
-    return np.bitwise_and(top_down, r_mask), np.bitwise_and(top_down, l_mask)
-
-
-def fit_lanes(right_lane, left_lane):
-    # image dimensions
-    height, width = left_lane.shape[:2]
-
-    # fit right lane
-    r_lane_pts = np.argwhere(right_lane == 1)
-    r_fit = np.polyfit(r_lane_pts[:, 0], r_lane_pts[:, 1], deg=2)
-    r_y = np.arange(11) * height / 10
-    r_x = r_fit[0] * r_y ** 2 + r_fit[1] * r_y + r_fit[2]
-
-    # fit left lane
-    l_lane_pts = np.argwhere(left_lane == 1)
-    l_fit = np.polyfit(l_lane_pts[:, 0], l_lane_pts[:, 1], deg=2)
-    l_y = np.arange(11) * height / 10
-    l_x = l_fit[0] * l_y ** 2 + l_fit[1] * l_y + l_fit[2]
-
-    return np.array((r_x, r_y)).T, np.array((l_x, l_y)).T
+    return left_fit, right_fit
 
 
 def _draw_pw_lines(img, pts, color):
-    # draw lines
-    pts = np.int_(pts)
-    for i in range(10):
-        x1 = pts[0][i][0]
-        y1 = pts[0][i][1]
-        x2 = pts[0][i + 1][0]
-        y2 = pts[0][i + 1][1]
-        cv2.line(img, (x1, y1), (x2, y2), color, 50)
+    num_points = pts.shape[0]
+    for i in range(num_points):
+        if i < num_points-1:
+            x1 = pts[i, 0]
+            y1 = pts[i, 1]
+            x2 = pts[i + 1, 0]
+            y2 = pts[i + 1, 1]
+            cv2.line(img, (x1, y1), (x2, y2), color, 50)
 
 
 def draw_lanes(undistorted, rfit, lfit, Minv):
     warp = np.zeros_like(undistorted[:,:,0]).astype(np.uint8)
     color_warp = np.dstack((warp, warp, warp))
 
-    pts = np.vstack((lfit, rfit[::-1, :]))
+    height, width = undistorted.shape[0], undistorted.shape[1]
+    yvals = np.linspace(height/2, height, height/2)
+
+    left_xy_coordinates = np.vstack((np.poly1d(lfit)(yvals), yvals)).T
+    right_xy_coordinates = np.vstack((np.poly1d(rfit)(yvals), yvals)).T
+
+    pts = np.vstack((left_xy_coordinates, right_xy_coordinates[::-1]))
 
     cv2.fillPoly(color_warp, np.uint([pts]), (0, 255, 255))
 
@@ -307,8 +292,8 @@ def draw_lanes(undistorted, rfit, lfit, Minv):
     right_lane_color = (255, 255, 255)  # white
 
     # draw lane lines using fit
-    _draw_pw_lines(color_warp, np.int_([lfit]), left_lane_color)
-    _draw_pw_lines(color_warp, np.int_([rfit]), right_lane_color)
+    _draw_pw_lines(color_warp, left_xy_coordinates.astype(np.int_), left_lane_color)
+    _draw_pw_lines(color_warp, right_xy_coordinates.astype(np.int_), right_lane_color)
 
     # revert image back to original perspective
     newwarp = cv2.warpPerspective(color_warp, Minv, (undistorted.shape[1], undistorted.shape[0]))
