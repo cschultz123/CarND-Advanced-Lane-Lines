@@ -178,7 +178,10 @@ def process_image(img,
     lanes = draw_lanes(undist, left_line.best_fit, right_line.best_fit, Minv)
 
     # annotate turn radius
-    _annotate_image(lanes, left_line.radius_of_curvature)
+    _annotate_radius(lanes, left_line.radius_of_curvature)
+
+    # annotate center offset
+    _annotate_center_offset(lanes, left_line, right_line)
 
     return lanes
 
@@ -188,6 +191,10 @@ class Line():
     This class is used to store state from computations on previous frames.
     """
     FRAME_HISTORY = 5
+
+    # Define conversions in x and y from pixels space to meters
+    YM_PER_PIX = 30 / 720  # meters per pixel in y dimension
+    XM_PER_PIX = 3.7 / 700  # meters per pixel in x dimension
 
     def __init__(self):
         # was the line detected in the last iteration?
@@ -262,6 +269,9 @@ class Line():
         self.ally = y
         self.best_fit = np.average(self.recent_xfitted, axis=0)
 
+        # find base position of line
+        self.line_base_pos = self.bestx(720)
+
         # Temporary complete histories
         self.all_xfitted.append(new_fit)
         self.all_radius.append(self.radius_of_curvature)
@@ -279,8 +289,8 @@ class Line():
         else:
             self._update_state(x, y)
 
-    @staticmethod
-    def _compute_turn_radius(x, y, image_height):
+    @classmethod
+    def _compute_turn_radius(cls, x, y, image_height):
         """
         This function computes the turn radius of the lane.
 
@@ -290,15 +300,11 @@ class Line():
         :param righty: (ndarray) right lane y coordinates
         :return: (tuple) left and right lane turn radius in meters
         """
-        # Define conversions in x and y from pixels space to meters
-        ym_per_pix = 30 / 720  # meters per pixel in y dimension
-        xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
-
         # Fit new polynomials to x,y in world space
-        fit_cr = np.polyfit(y * ym_per_pix, x * xm_per_pix, 2)
+        fit_cr = np.polyfit(y * cls.YM_PER_PIX, x * cls.XM_PER_PIX, 2)
 
         # Calculate the new radii of curvature
-        curverad = ((1 + (2 * fit_cr[0] * image_height * ym_per_pix + fit_cr[1]) ** 2) ** 1.5) / np.absolute(
+        curverad = ((1 + (2 * fit_cr[0] * image_height * cls.YM_PER_PIX + fit_cr[1]) ** 2) ** 1.5) / np.absolute(
             2 * fit_cr[0])
 
         return np.round(curverad, decimals=2)
@@ -417,7 +423,7 @@ def _draw_pw_lines(img, pts, color):
             cv2.line(img, (x1, y1), (x2, y2), color, 50)
 
 
-def _annotate_image(image, curve_radius):
+def _annotate_radius(image, curve_radius):
     """
     Annotate the image with radius of curvature. This procedure augments the
     input image.
@@ -439,12 +445,43 @@ def _annotate_image(image, curve_radius):
                 cv2.LINE_AA)
 
 
+def _annotate_center_offset(image, left_line, right_line):
+    """
+    Annotate the image with offset from center of lane. This procedure augments
+    the input image.
+
+    :param left_line: (Line) left lane line
+    :param right_line: (Line) right lane line
+    """
+    # Get center x value for each lane
+    leftx, rightx = left_line.line_base_pos, right_line.line_base_pos
+
+    # Compute lane center
+    lane_center = leftx + (rightx-leftx)/2
+
+    # Compute center offset
+    center_offset = np.round((lane_center - image.shape[1]/2) * Line.XM_PER_PIX, decimals=2)
+
+    center_offset_text = "Vehicle is {}m left of center".format(center_offset)
+
+    # set coordinates for annotated text
+    xpos = np.int(image.shape[1] * 0.1)
+    ypos = np.int(image.shape[0] * 0.2)
+
+    # set font to use
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # add text to image
+    cv2.putText(image, center_offset_text, (xpos, ypos), font, 2, (255, 255, 255), 2,
+                cv2.LINE_AA)
+
+
 def draw_lanes(undistorted, rfit, lfit, Minv):
     warp = np.zeros_like(undistorted[:,:,0]).astype(np.uint8)
     color_warp = np.dstack((warp, warp, warp))
 
     height, width = undistorted.shape[0], undistorted.shape[1]
-    yvals = np.linspace(height*0.1, height, height*0.9)
+    yvals = np.linspace(0, height, height)
 
     left_xy_coordinates = np.vstack((np.poly1d(lfit)(yvals), yvals)).T
     right_xy_coordinates = np.vstack((np.poly1d(rfit)(yvals), yvals)).T
@@ -461,7 +498,7 @@ def draw_lanes(undistorted, rfit, lfit, Minv):
     _draw_pw_lines(color_warp, right_xy_coordinates.astype(np.int_), right_lane_color)
 
     # revert image back to original perspective
-    newwarp = cv2.warpPerspective(color_warp, Minv, (undistorted.shape[1], undistorted.shape[0]))
+    newwarp = cv2.warpPerspective(color_warp, Minv, (width, height))
 
     result = cv2.addWeighted(undistorted, 1, newwarp, 0.5, 0)
 
