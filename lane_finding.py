@@ -134,6 +134,8 @@ def pipeline(img,
 def process_image(img,
                   camera_matrix,
                   distortion,
+                  left_line=None,
+                  right_line=None,
                   hue_thresh=(0,100),
                   sat_thresh=(160,255),
                   x_thresh=(10,255),
@@ -170,45 +172,185 @@ def process_image(img,
     #
     # # fit 2nd order polynomial to left and right lanes
     # rpts, lpts = fit_lanes(right, left)
-    left_fit, right_fit = find_lanes(top)
+    left_line, right_line = find_lanes(top, left_line, right_line)
 
     # draw lanes on original undistorted image
-    return draw_lanes(undist, rfit=right_fit, lfit=left_fit, Minv=Minv)
+    lanes = draw_lanes(undist, left_line.best_fit, right_line.best_fit, Minv)
+
+    # annotate turn radius
+    _annotate_image(lanes, left_line.radius_of_curvature)
+
+    return lanes
 
 
-class Lanes(object):
+class Line():
     """
-    This class provides methods for finding lanes from image. It also stores
-    state that is used for outlier detection.
+    This class is used to store state from computations on previous frames.
     """
+    FRAME_HISTORY = 5
 
     def __init__(self):
-        pass
+        # was the line detected in the last iteration?
+        self.detected = False
+        # x values of the last n fits of the line
+        self.recent_xfitted = []
+        #polynomial coefficients averaged over the last n iterations
+        self.best_fit = None
+        #polynomial coefficients for the most recent fit
+        self.current_fit = [np.array([False])]
+        #radius of curvature of the line in some units
+        self.radius_of_curvature = None
+        #distance in meters of vehicle center from the line
+        self.line_base_pos = None
+        #difference in fit coefficients between last and new fits
+        self.diffs = np.array([0,0,0], dtype='float')
+        #x values for detected line pixels
+        self.allx = None
+        #y values for detected line pixels
+        self.ally = None
+
+        # all fit values
+        self.all_xfitted = []
+
+        # all radiuses
+        self.all_radius = []
+
+    @property
+    def bestx(self):
+        """Returns fitted polynomial"""
+        return np.poly1d(self.best_fit)
 
 
+    def _reset_state(self):
+        """
+        Reset current state of line. Note, this does not erase the historical
+        parameters.
+        """
+        self.detected = False
+        self.current_fit = [np.array([False])]
+        self.allx = None
+        self.ally = None
 
-def find_lanes(img, num_windows=9, window_margin=100, minimum_pixels=50):
+
+    def _update_state(self, x, y):
+        """
+        Update line attributes given successful line detection.
+
+        :param x: (ndarray) x coordinates of lane pixels
+        :param y: (ndarray) y coordinates of lane pixels
+        """
+        # Compute curvature of lane
+        radius_of_curvature = self._compute_turn_radius(x, y, 360)
+        if self.is_radius_outlier(radius_of_curvature):
+            self._reset_state()
+            return
+        self.radius_of_curvature = radius_of_curvature
+
+        # Fit second order polynomial to lane
+        new_fit = np.polyfit(y, x, 2)
+        if self.is_fit_outlier(new_fit):
+            self._reset_state()
+            return
+        self.current_fit = new_fit
+
+        # Update averaged line properties
+        self.recent_xfitted.insert(0, self.current_fit)
+        if len(self.recent_xfitted) > self.FRAME_HISTORY:
+            self.recent_xfitted.pop()
+
+        self.allx = x
+        self.ally = y
+        self.best_fit = np.average(self.recent_xfitted, axis=0)
+
+        # Temporary complete histories
+        self.all_xfitted.append(new_fit)
+        self.all_radius.append(self.radius_of_curvature)
+
+    def compute_line_properties(self, x, y):
+        """
+        Compute line attributes from x and y pixel locations of lane.
+
+        :param x: (ndarray) x coordinate of lane pixels
+        :param y: (ndarray) y coordinate of lane pixels
+        """
+        # Check if lane pixels were found
+        if x.size == 0 or y.size == 0:
+            self._reset_state()
+        else:
+            self._update_state(x, y)
+
+    @staticmethod
+    def _compute_turn_radius(x, y, image_height):
+        """
+        This function computes the turn radius of the lane.
+
+        :param leftx: (ndarray) left lane x coordinates
+        :param lefty: (ndarray) left lane y coordinates
+        :param rightx: (ndarray) right lane x coordinates
+        :param righty: (ndarray) right lane y coordinates
+        :return: (tuple) left and right lane turn radius in meters
+        """
+        # Define conversions in x and y from pixels space to meters
+        ym_per_pix = 30 / 720  # meters per pixel in y dimension
+        xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
+
+        # Fit new polynomials to x,y in world space
+        fit_cr = np.polyfit(y * ym_per_pix, x * xm_per_pix, 2)
+
+        # Calculate the new radii of curvature
+        curverad = ((1 + (2 * fit_cr[0] * image_height * ym_per_pix + fit_cr[1]) ** 2) ** 1.5) / np.absolute(
+            2 * fit_cr[0])
+
+        return np.round(curverad, decimals=2)
+
+    def is_radius_outlier(self, radius_of_curvature):
+        """Returns True if new radius is outlier."""
+        if self.radius_of_curvature:
+            return np.abs(radius_of_curvature - self.radius_of_curvature) > 2500
+        return False
+
+    def is_fit_outlier(self, new_fit):
+        """Returns True if new fit is outlier."""
+        if self.detected:
+            diff = np.abs(new_fit - self.current_fit)
+            if diff[0] > 0.00003 or diff[1] > 0.03:
+                return True
+        return False
+
+
+def find_lanes(img, left_line=None, right_line=None, num_windows=9, window_margin=100, minimum_pixels=50):
     """
     This function applies a sliding window technique to identify the lanes and
     fit a 2nd order polynomial to them.
 
     :param img: (binary) thresholded and warped image
+    :param left_line: (Line) left lane line
+    :param right_line: (Line) right lane line
     :param num_windows: (int) number of vertical windows
     :param window_margin: (int) window width +/- margin
     :param minimum_pixels: (int) number of pixels required to move window center
-    :return: left lane line coefficients, right lane line coefficients
+    :return: (tuple) left lane line coefficients, right lane line coefficients,
+        left lane curve radius (meters), right lane curve radius (meters)
     """
+    if left_line is None:
+        left_line = Line()
+    if right_line is None:
+        right_line = Line()
+
+    # Image dimensions
+    image_height, image_width = img.shape
+
     # Take a histogram of the whole of the image
     histogram = np.sum(img[:, :], axis=0)
 
     # Find the peak of the left and right halves of the histogram
     # These will be the starting point for the left and right lines
-    midpoint = np.int(histogram.shape[0] / 2)
+    midpoint = np.int(image_width / 2)
     leftx_base = np.argmax(histogram[:midpoint])
     rightx_base = np.argmax(histogram[midpoint:]) + midpoint
 
     # Set height of windows
-    window_height = np.int(img.shape[0] / num_windows)
+    window_height = np.int(image_height / num_windows)
 
     # Identify the x and y positions of all nonzero pixels in the image
     nonzero = img.nonzero()
@@ -226,8 +368,8 @@ def find_lanes(img, num_windows=9, window_margin=100, minimum_pixels=50):
     # Step through the windows one by one
     for window in range(num_windows):
         # Identify window boundaries in x and y (and right and left)
-        win_y_low = img.shape[0] - (window + 1) * window_height
-        win_y_high = img.shape[0] - window * window_height
+        win_y_low = image_height - (window + 1) * window_height
+        win_y_high = image_height - window * window_height
         win_xleft_low = leftx_current - window_margin
         win_xleft_high = leftx_current + window_margin
         win_xright_low = rightx_current - window_margin
@@ -250,17 +392,18 @@ def find_lanes(img, num_windows=9, window_margin=100, minimum_pixels=50):
     left_lane_inds = np.concatenate(left_lane_inds)
     right_lane_inds = np.concatenate(right_lane_inds)
 
-    # Extract left and right line pixel positions
+
+    # Extract left and right lane pixel positions
     leftx = nonzerox[left_lane_inds]
     lefty = nonzeroy[left_lane_inds]
     rightx = nonzerox[right_lane_inds]
     righty = nonzeroy[right_lane_inds]
 
-    # Fit a second order polynomial to each
-    left_fit = np.polyfit(lefty, leftx, 2)
-    right_fit = np.polyfit(righty, rightx, 2)
+    # Compute line attributes
+    left_line.compute_line_properties(leftx, lefty)
+    right_line.compute_line_properties(rightx, righty)
 
-    return left_fit, right_fit
+    return left_line, right_line
 
 
 def _draw_pw_lines(img, pts, color):
@@ -274,12 +417,34 @@ def _draw_pw_lines(img, pts, color):
             cv2.line(img, (x1, y1), (x2, y2), color, 50)
 
 
+def _annotate_image(image, curve_radius):
+    """
+    Annotate the image with radius of curvature. This procedure augments the
+    input image.
+
+    :param image: (ndarray) image to be annotated
+    :param curve_radius: (float) radius of curvature (meters)
+    """
+    radius_text = 'Turn Radius: {} meters'.format(curve_radius)
+
+    # set coordinates for annotated text
+    xpos = np.int(image.shape[1] * 0.1)
+    ypos = np.int(image.shape[0] * 0.1)
+
+    # set font to use
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # add text to image
+    cv2.putText(image, radius_text, (xpos, ypos), font, 2, (255, 255, 255), 2,
+                cv2.LINE_AA)
+
+
 def draw_lanes(undistorted, rfit, lfit, Minv):
     warp = np.zeros_like(undistorted[:,:,0]).astype(np.uint8)
     color_warp = np.dstack((warp, warp, warp))
 
     height, width = undistorted.shape[0], undistorted.shape[1]
-    yvals = np.linspace(height/2, height, height/2)
+    yvals = np.linspace(height*0.1, height, height*0.9)
 
     left_xy_coordinates = np.vstack((np.poly1d(lfit)(yvals), yvals)).T
     right_xy_coordinates = np.vstack((np.poly1d(rfit)(yvals), yvals)).T
